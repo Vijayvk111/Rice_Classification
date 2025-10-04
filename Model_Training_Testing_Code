@@ -1,0 +1,522 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+import torchvision.transforms as transforms
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+import timm
+from PIL import Image
+import cv2
+import os
+import warnings
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import f1_score
+from collections import Counter
+import time
+import gc
+import random
+
+warnings.filterwarnings('ignore')
+
+print("COMPLETE SOLUTION")
+print("Target: 0.95+ F1 Score")
+print("="*50)
+
+CONFIG = {
+    'seed': 42,
+    'image_sizes': [224, 256, 288],
+    'batch_size': 20,
+    'num_epochs': 25,
+    'base_lr': 0.0008,
+    'weight_decay': 1e-5,
+    'num_workers': 2,
+    'num_folds': 4,
+    'models': [
+        'efficientnet_b4',
+        'efficientnet_b5', 
+        'resnet101',
+        'densenet161'
+    ],
+    'tta_count': 6,
+}
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+set_seed(CONFIG['seed'])
+
+def load_data():
+    """Paths of the datasets relevant to competition from Kaggle platform"""
+    paths = {
+        'train_csv': '/kaggle/input/rice-pistachio-and-grapevine-leaf-classification/train.csv',
+        'sample_submission': '/kaggle/input/rice-pistachio-and-grapevine-leaf-classification/sample_submission.csv', 
+        'train_images': '/kaggle/input/rice-pistachio-and-grapevine-leaf-classification/train/train',
+        'test_images': '/kaggle/input/rice-pistachio-and-grapevine-leaf-classification/test/test'
+    }
+    
+    for name, path in paths.items():
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing: {name} -> {path}")
+    
+    train_df = pd.read_csv(paths['train_csv']).dropna()
+    sample_sub = pd.read_csv(paths['sample_submission'])
+    
+    id_col, target_col = train_df.columns[0], train_df.columns[1]
+    num_classes = train_df[target_col].nunique()
+    
+    print(f"Data loaded: {len(train_df)} train, {len(sample_sub)} test, {num_classes} classes")
+    
+    class_counts = train_df[target_col].value_counts()
+    class_weights = {}
+    for cls in class_counts.index:
+        class_weights[cls] = len(train_df) / (num_classes * class_counts[cls])
+    
+    return {
+        'paths': paths, 'train_df': train_df, 'sample_sub': sample_sub,
+        'id_col': id_col, 'target_col': target_col, 'num_classes': num_classes,
+        'class_weights': class_weights
+    }
+
+def get_transforms(img_size, is_training=True):
+    
+    if is_training:
+        return transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
+            transforms.RandomRotation(degrees=45),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.15, hue=0.08),
+            transforms.RandomAffine(degrees=15, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+    else:
+        return transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+
+class EliteDataset(Dataset):
+    def __init__(self, df, img_dir, id_col, target_col=None, transform=None, 
+                 label_encoder=None, is_test=False):
+        self.df = df.reset_index(drop=True)
+        self.img_dir = img_dir
+        self.id_col = id_col
+        self.target_col = target_col
+        self.transform = transform
+        self.is_test = is_test
+        
+        if not is_test:
+            if label_encoder is None:
+                unique_labels = sorted(df[target_col].unique())
+                self.label_encoder = {label: idx for idx, label in enumerate(unique_labels)}
+            else:
+                self.label_encoder = label_encoder
+            self.idx_to_label = {v: k for k, v in self.label_encoder.items()}
+        else:
+            self.label_encoder = label_encoder
+            if label_encoder:
+                self.idx_to_label = {v: k for k, v in label_encoder.items()}
+        
+        self.image_files = set(os.listdir(img_dir))
+        print(f"Dataset ready: {len(df)} samples")
+    
+    def find_image_path(self, img_id):
+        img_id = str(img_id).strip()
+        candidates = [
+            f"{img_id}.jpg", f"{img_id}.png", f"{img_id}.jpeg",
+            f"{img_id.zfill(4)}.jpg", f"{img_id.zfill(4)}.png",
+            f"{img_id.zfill(5)}.jpg", f"{img_id.zfill(5)}.png",
+            img_id
+        ]
+        
+        for candidate in candidates:
+            if candidate in self.image_files:
+                return os.path.join(self.img_dir, candidate)
+        return None
+    
+    def __len__(self):
+        return len(self.df)
+    
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        img_id = str(row[self.id_col]).strip()
+        
+        img_path = self.find_image_path(img_id)
+        if img_path is None:
+            raise FileNotFoundError(f"Image not found: {img_id}")
+        
+        try:
+            image = Image.open(img_path).convert('RGB')
+        except:
+            try:
+                image = cv2.imread(img_path)
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                image = Image.fromarray(image)
+            except Exception as e:
+                raise RuntimeError(f"Cannot load {img_path}: {e}")
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        if self.is_test:
+            return image, img_id
+        else:
+            label_idx = self.label_encoder[row[self.target_col]]
+            return image, label_idx
+
+class EliteModel(nn.Module):
+    def __init__(self, model_name, num_classes, img_size=224):
+        super().__init__()
+        self.model_name = model_name
+        
+        try:
+            if 'efficientnet' in model_name:
+                self.backbone = timm.create_model(model_name, pretrained=True, num_classes=0)
+            elif model_name == 'resnet101':
+                from torchvision.models import resnet101
+                self.backbone = resnet101(pretrained=True)
+                self.backbone.fc = nn.Identity()
+            elif model_name == 'densenet161':
+                from torchvision.models import densenet161
+                self.backbone = densenet161(pretrained=True)
+                self.backbone.classifier = nn.Identity()
+            else:
+                self.backbone = timm.create_model('efficientnet_b3', pretrained=True, num_classes=0)
+        except:
+            print(f"Failed to load {model_name}, using EfficientNet-B3")
+            self.backbone = timm.create_model('efficientnet_b3', pretrained=True, num_classes=0)
+        
+        # Get feature dimension
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, img_size, img_size)
+            features = self.backbone(dummy_input)
+            if len(features.shape) > 2:
+                features = F.adaptive_avg_pool2d(features, 1).flatten(1)
+            self.feature_dim = features.shape[1]
+        
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(self.feature_dim, 1024),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.4),
+            nn.Linear(1024, 512),
+            nn.BatchNorm1d(512), 
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_classes)
+        )
+        
+        for m in self.classifier.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight)
+                nn.init.constant_(m.bias, 0)
+        
+        print(f"Model {model_name}: {self.feature_dim} -> {num_classes}")
+    
+    def forward(self, x):
+        features = self.backbone(x)
+        if len(features.shape) > 2:
+            features = F.adaptive_avg_pool2d(features, 1).flatten(1)
+        return self.classifier(features)
+
+class EliteTrainer:
+    def __init__(self, model, train_loader, val_loader, device, class_weights=None):
+        self.model = model.to(device)
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.device = device
+        
+        # Advanced optimizer
+        backbone_params = [p for n, p in model.named_parameters() if 'classifier' not in n]
+        classifier_params = [p for n, p in model.named_parameters() if 'classifier' in n]
+        
+        self.optimizer = AdamW([
+            {'params': backbone_params, 'lr': CONFIG['base_lr'] * 0.1},
+            {'params': classifier_params, 'lr': CONFIG['base_lr']}
+        ], weight_decay=CONFIG['weight_decay'])
+        
+        self.scheduler = CosineAnnealingWarmRestarts(
+            self.optimizer, T_0=7, T_mult=2, eta_min=CONFIG['base_lr'] * 0.01
+        )
+        
+        if class_weights is not None:
+            weights = torch.FloatTensor(list(class_weights.values())).to(device)
+            self.criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.1)
+        else:
+            self.criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        
+        self.best_f1 = 0
+        self.best_model_state = None
+        self.patience = 0
+    
+    def train_epoch(self):
+        self.model.train()
+        total_loss = 0
+        num_batches = 0
+        
+        for batch_idx, (images, labels) in enumerate(self.train_loader):
+            try:
+                images = images.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
+                
+                self.optimizer.zero_grad()
+                outputs = self.model(images)
+                loss = self.criterion(outputs, labels)
+                loss.backward()
+                
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                
+                total_loss += loss.item()
+                num_batches += 1
+                
+                if batch_idx % 20 == 0:
+                    print(f"    Batch {batch_idx}/{len(self.train_loader)}: {loss.item():.4f}")
+                    
+            except Exception as e:
+                print(f"Batch error: {e}")
+                continue
+        
+        return total_loss / max(num_batches, 1)
+    
+    def validate(self):
+        self.model.eval()
+        all_preds, all_labels = [], []
+        
+        with torch.no_grad():
+            for images, labels in self.val_loader:
+                try:
+                    images = images.to(self.device, non_blocking=True)
+                    labels = labels.to(self.device, non_blocking=True)
+                    
+                    outputs = self.model(images)
+                    preds = outputs.argmax(dim=1)
+                    
+                    all_preds.extend(preds.cpu().numpy())
+                    all_labels.extend(labels.cpu().numpy())
+                except Exception as e:
+                    print(f"Validation error: {e}")
+                    continue
+        
+        if len(all_preds) == 0:
+            return 0.0
+        
+        return f1_score(all_labels, all_preds, average='micro')
+    
+    def train_model(self):
+        print(f"Training {self.model.model_name}...")
+        
+        for epoch in range(CONFIG['num_epochs']):
+            epoch_start = time.time()
+            
+            train_loss = self.train_epoch()
+            val_f1 = self.validate()
+            self.scheduler.step()
+            
+            epoch_time = time.time() - epoch_start
+            lr = self.optimizer.param_groups[0]['lr']
+            
+            print(f"Epoch {epoch+1}: Loss {train_loss:.4f}, F1 {val_f1:.4f}, LR {lr:.6f}, Time {epoch_time:.1f}s")
+            
+            if val_f1 > self.best_f1:
+                self.best_f1 = val_f1
+                self.best_model_state = self.model.state_dict().copy()
+                self.patience = 0
+                print(f"  New best: {val_f1:.4f}")
+            else:
+                self.patience += 1
+            
+            if self.patience >= 6:
+                print("Early stopping")
+                break
+            
+            if epoch % 5 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+        
+        if self.best_model_state:
+            self.model.load_state_dict(self.best_model_state)
+        
+        return self.best_f1
+
+def tta_predict(model, test_loader, device):
+    """Test time augmentation"""
+    model.eval()
+    all_predictions = []
+    
+    tta_transforms = [
+        lambda x: x,
+        lambda x: torch.flip(x, [3]),
+        lambda x: torch.flip(x, [2]),
+        lambda x: torch.flip(x, [2, 3]),
+        lambda x: torch.rot90(x, k=1, dims=[2, 3]),
+        lambda x: torch.rot90(x, k=2, dims=[2, 3]),
+    ]
+    
+    with torch.no_grad():
+        for images, _ in test_loader:
+            images = images.to(device)
+            batch_preds = []
+            
+            for transform in tta_transforms[:CONFIG['tta_count']]:
+                try:
+                    transformed = transform(images)
+                    outputs = model(transformed)
+                    probs = F.softmax(outputs, dim=1)
+                    batch_preds.append(probs)
+                except Exception as e:
+                    print(f"TTA error: {e}")
+                    continue
+            
+            if batch_preds:
+                avg_pred = torch.stack(batch_preds).mean(0)
+                all_predictions.append(avg_pred.cpu())
+    
+    return torch.cat(all_predictions) if all_predictions else None
+
+def main():
+    start_time = time.time()
+    
+    print("Loading data...")
+    data = load_data()
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Device: {device}")
+    
+    skf = StratifiedKFold(n_splits=CONFIG['num_folds'], shuffle=True, random_state=CONFIG['seed'])
+    
+    all_predictions = []
+    fold_scores = []
+    
+    for fold, (train_idx, val_idx) in enumerate(skf.split(data['train_df'], data['train_df'][data['target_col']])):
+        print(f"\nFOLD {fold+1}/{CONFIG['num_folds']}")
+        print("=" * 40)
+        
+        train_fold = data['train_df'].iloc[train_idx]
+        val_fold = data['train_df'].iloc[val_idx]
+        
+        img_size = CONFIG['image_sizes'][fold % len(CONFIG['image_sizes'])]
+        model_name = CONFIG['models'][fold % len(CONFIG['models'])]
+        
+        print(f"Model: {model_name}, Image size: {img_size}")
+        
+        # Create datasets
+        train_dataset = EliteDataset(
+            train_fold, data['paths']['train_images'],
+            data['id_col'], data['target_col'],
+            transform=get_transforms(img_size, True)
+        )
+        
+        val_dataset = EliteDataset(
+            val_fold, data['paths']['train_images'],
+            data['id_col'], data['target_col'],
+            transform=get_transforms(img_size, False),
+            label_encoder=train_dataset.label_encoder
+        )
+        
+        # Weighted sampling
+        class_counts = Counter(train_fold[data['target_col']])
+        weights = [1.0 / class_counts[train_fold.iloc[i][data['target_col']]] 
+                  for i in range(len(train_fold))]
+        sampler = WeightedRandomSampler(weights, len(weights))
+        
+        # Data loaders
+        train_loader = DataLoader(
+            train_dataset, batch_size=CONFIG['batch_size'],
+            sampler=sampler, num_workers=CONFIG['num_workers'], 
+            pin_memory=True, drop_last=True
+        )
+        
+        val_loader = DataLoader(
+            val_dataset, batch_size=CONFIG['batch_size'],
+            shuffle=False, num_workers=CONFIG['num_workers'], pin_memory=True
+        )
+        
+        # Create and train model
+        model = EliteModel(model_name, data['num_classes'], img_size)
+        trainer = EliteTrainer(model, train_loader, val_loader, device, data['class_weights'])
+        
+        fold_f1 = trainer.train_model()
+        fold_scores.append(fold_f1)
+        
+        print(f"Fold {fold+1} F1: {fold_f1:.4f}")
+        
+        # Generate test predictions
+        test_dataset = EliteDataset(
+            data['sample_sub'], data['paths']['test_images'],
+            data['sample_sub'].columns[0], transform=get_transforms(img_size, False),
+            label_encoder=train_dataset.label_encoder, is_test=True
+        )
+        
+        test_loader = DataLoader(
+            test_dataset, batch_size=CONFIG['batch_size'],
+            shuffle=False, num_workers=CONFIG['num_workers']
+        )
+        
+        fold_predictions = tta_predict(model, test_loader, device)
+        if fold_predictions is not None:
+            all_predictions.append(fold_predictions)
+        
+        # Cleanup
+        del model, trainer, train_loader, val_loader
+        gc.collect()
+        torch.cuda.empty_cache()
+    
+    # Ensemble predictions
+    print(f"\nCreating ensemble from {len(all_predictions)} models...")
+    
+    if len(all_predictions) > 0:
+        # Weight by performance
+        weights = np.array(fold_scores)
+        weights = weights / weights.sum()
+        
+        final_predictions = None
+        for i, pred in enumerate(all_predictions):
+            if final_predictions is None:
+                final_predictions = pred * weights[i]
+            else:
+                final_predictions += pred * weights[i]
+        
+        predicted_classes = final_predictions.argmax(dim=1).numpy()
+        
+        # Convert to labels
+        unique_classes = sorted(data['train_df'][data['target_col']].unique())
+        idx_to_label = {idx: label for idx, label in enumerate(unique_classes)}
+        predicted_labels = [idx_to_label[idx] for idx in predicted_classes]
+        
+        # Create submission
+        submission = data['sample_sub'].copy()
+        submission[submission.columns[1]] = predicted_labels
+        submission.to_csv('submission.csv', index=False)
+        
+        # Results
+        avg_f1 = np.mean(fold_scores)
+        weighted_f1 = np.sum(weights * np.array(fold_scores))
+        total_time = time.time() - start_time
+        
+        print(f"\nRESULTS:")
+        print(f"Fold scores: {[f'{f:.4f}' for f in fold_scores]}")
+        print(f"Average F1: {avg_f1:.4f}")
+        print(f"Weighted F1: {weighted_f1:.4f}")
+        print(f"Training time: {total_time/60:.1f} minutes")
+        print(f"Performance : {weighted_f1:.4f}")
+        
+        return weighted_f1
+    else:
+        print("No valid predictions generated!")
+        return 0.0
+
+if __name__ == "__main__":
+    final_score = main()
+    print(f"\nExpected Output: {final_score:.4f}")
+    print("Classification model ready!")
